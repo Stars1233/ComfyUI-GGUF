@@ -10,7 +10,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -199,6 +199,13 @@ LLAMA_SD_MAP = {
     "output.weight": "lm_head.weight",
 }
 
+GEMMA3_SD_MAP = LLAMA_SD_MAP.copy()
+GEMMA3_SD_MAP.update({
+    "ffn_pre_norm": "pre_feedforward_layernorm",
+    "post_ffw_norm": "post_feedforward_layernorm",
+    "post_attention_norm": "post_attention_layernorm",
+})
+
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
     "v.post_ln.": "visual.merger.ln_q.",
@@ -219,6 +226,61 @@ def sd_map_replace(raw_sd, key_map):
             k = k.replace(s,d)
         sd[k] = v
     return sd
+
+##GEMMA3 
+def fix_gemma3_llama_cpp_keys(sd):
+    for k in list(sd.keys()):
+        if k.endswith(".ffn_norm.weight"):
+            new_k = k.replace(".ffn_norm.weight", ".ffn_pre_norm.weight")
+            sd[new_k] = sd.pop(k)
+    return sd
+
+def gemma3_norm_corrections(sd):
+    norm_patterns = [
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "pre_feedforward_layernorm.weight",
+        "post_feedforward_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "model.norm.weight"
+    ]
+    corrected = 0
+    for key in list(sd.keys()):
+        if any(p in key for p in norm_patterns):
+            if is_quantized(sd[key]):
+                sd[key] = dequantize_tensor(sd[key], dtype=torch.float32) - 1.0
+            else:
+                sd[key] = sd[key].float() - 1.0
+            corrected += 1
+    #logging.info(f"Gemma3: Applied -1 norm correction to {corrected} tensors")
+    return sd
+
+def load_gemma3_tokenizer(path, base_dir):
+    # Using gemma3 tokenizer.model
+    #https://huggingface.co/google/gemma-3-12b-it/resolve/main/tokenizer.model
+    base_dir = os.path.dirname(path)
+    
+    tokenizer_search_paths = [
+        os.path.join(base_dir, "tokenizer.model"),
+        os.path.join(base_dir, "gemma3-tokenizer.model"),
+    ]
+    for tok_path in tokenizer_search_paths:
+        if os.path.exists(tok_path):
+            try:
+                with open(tok_path, "rb") as f:
+                    tokenizer_bytes = f.read()
+                logging.info(f"Loaded Gemma3 tokenizer from: {tok_path} ({len(tokenizer_bytes)} bytes)")
+                return torch.frombuffer(bytearray(tokenizer_bytes), dtype=torch.uint8)
+            except Exception as e:
+                logging.warning(f"Failed to load tokenizer from {tok_path}: {e}")
+    
+    error_msg = (
+        f"Gemma3 tokenizer not found for: {os.path.basename(path)}\n"
+        f"Place 'tokenizer.model' in: {base_dir}"
+    )
+    logging.error(f"{error_msg}")
+    raise FileNotFoundError(error_msg)
 
 def llama_permute(raw_sd, n_head, n_head_kv):
     # Reverse version of LlamaModel.permute in llama.cpp convert script
@@ -408,17 +470,24 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl"}:
+    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
             if arch == "llama" and sd[temb_key].shape == (131072, 5120):
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
+            elif arch == "gemma3":
+                sd["spiece_model"] = load_gemma3_tokenizer(path, os.path.dirname(path))
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
-        sd = sd_map_replace(sd, LLAMA_SD_MAP)
+        if arch == "gemma3":
+            sd = fix_gemma3_llama_cpp_keys(sd)
+            sd = sd_map_replace(sd, GEMMA3_SD_MAP)
+            sd = gemma3_norm_corrections(sd)
+        else:
+            sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
         if arch == "qwen2vl":
