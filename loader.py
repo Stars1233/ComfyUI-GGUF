@@ -496,4 +496,3 @@ def gguf_clip_loader(path):
     else:
         pass
     return sd
-
