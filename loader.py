@@ -256,31 +256,46 @@ def gemma3_norm_corrections(sd):
     #logging.info(f"Gemma3: Applied -1 norm correction to {corrected} tensors")
     return sd
 
-def load_gemma3_tokenizer(path, base_dir):
-    # Using gemma3 tokenizer.model
-    #https://huggingface.co/google/gemma-3-12b-it/resolve/main/tokenizer.model
-    base_dir = os.path.dirname(path)
+def gguf_gemma3_tokenizer_loader(path):
+    logging.info("Attempting to recreate sentencepiece tokenizer from GGUF file metadata...")
+    try:
+        from sentencepiece import sentencepiece_model_pb2 as model
+    except ImportError:
+        raise ImportError("Please install sentencepiece and protobuf.\npip install sentencepiece protobuf")
+    spm = model.ModelProto()
+    reader = gguf.GGUFReader(path)
+
+    spm.normalizer_spec.name = "identity"
+    spm.normalizer_spec.add_dummy_prefix = False
+    spm.trainer_spec.model_type = 2
+    spm.trainer_spec.input_format = "tsv"
+    spm.trainer_spec.byte_fallback = True
+    spm.trainer_spec.max_sentence_length = 4192
+    spm.trainer_spec.bos_piece = "<bos>"
+
+    tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
+    scores = get_list_field(reader, "tokenizer.ggml.scores", float)
+    toktype = get_list_field(reader, "tokenizer.ggml.token_type", int)
     
-    tokenizer_search_paths = [
-        os.path.join(base_dir, "tokenizer.model"),
-        os.path.join(base_dir, "gemma3-tokenizer.model"),
-    ]
-    for tok_path in tokenizer_search_paths:
-        if os.path.exists(tok_path):
-            try:
-                with open(tok_path, "rb") as f:
-                    tokenizer_bytes = f.read()
-                logging.info(f"Loaded Gemma3 tokenizer from: {tok_path} ({len(tokenizer_bytes)} bytes)")
-                return torch.frombuffer(bytearray(tokenizer_bytes), dtype=torch.uint8)
-            except Exception as e:
-                logging.warning(f"Failed to load tokenizer from {tok_path}: {e}")
+    if not tokens or not scores or not toktype:
+        raise ValueError("Missing tokenizer metadata")
     
-    error_msg = (
-        f"Gemma3 tokenizer not found for: {os.path.basename(path)}\n"
-        f"Place 'tokenizer.model' in: {base_dir}"
-    )
-    logging.error(f"{error_msg}")
-    raise FileNotFoundError(error_msg)
+    for idx in range(len(tokens)):
+        piece = spm.SentencePiece()
+        piece.piece = tokens[idx]
+        if idx == 3:  # UNK position
+            piece.type = 2  # UNK Token
+            piece.score = 0.0 # UNK Score
+        else:
+            piece.type = toktype[idx]
+            piece.score = scores[idx]
+        spm.pieces.append(piece)
+    
+    spm.trainer_spec.vocab_size = len(spm.pieces)
+    logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
+    
+    del reader
+    return torch.ByteTensor(list(spm.SerializeToString()))
 
 def llama_permute(raw_sd, n_head, n_head_kv):
     # Reverse version of LlamaModel.permute in llama.cpp convert script
@@ -477,8 +492,8 @@ def gguf_clip_loader(path):
             if arch == "llama" and sd[temb_key].shape == (131072, 5120):
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
-            elif arch == "gemma3":
-                sd["spiece_model"] = load_gemma3_tokenizer(path, os.path.dirname(path))
+            if arch == "gemma3":
+                sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
