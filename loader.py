@@ -492,7 +492,7 @@ def gguf_clip_loader(path):
             if arch == "llama" and sd[temb_key].shape == (131072, 5120):
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
-            if arch == "gemma3":
+            elif arch == "gemma3":
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
