@@ -201,7 +201,7 @@ LLAMA_SD_MAP = {
 
 GEMMA3_SD_MAP = LLAMA_SD_MAP.copy()
 GEMMA3_SD_MAP.update({
-    "ffn_pre_norm": "pre_feedforward_layernorm",
+    "ffn_norm": "pre_feedforward_layernorm",
     "post_ffw_norm": "post_feedforward_layernorm",
     "post_attention_norm": "post_attention_layernorm",
 })
@@ -227,15 +227,20 @@ def sd_map_replace(raw_sd, key_map):
         sd[k] = v
     return sd
 
-##GEMMA3 
-def fix_gemma3_llama_cpp_keys(sd):
-    for k in list(sd.keys()):
-        if k.endswith(".ffn_norm.weight"):
-            new_k = k.replace(".ffn_norm.weight", ".ffn_pre_norm.weight")
-            sd[new_k] = sd.pop(k)
+def llama_permute(raw_sd, n_head, n_head_kv):
+    # Reverse version of LlamaModel.permute in llama.cpp convert script
+    sd = {}
+    permute = lambda x,h: x.reshape(h, x.shape[0] // h // 2, 2, *x.shape[1:]).swapaxes(1, 2).reshape(x.shape)
+    for k,v in raw_sd.items():
+        if k.endswith(("q_proj.weight", "q_proj.bias")):
+            v.data = permute(v.data, n_head)
+        if k.endswith(("k_proj.weight", "k_proj.bias")):
+            v.data = permute(v.data, n_head_kv)
+        sd[k] = v
     return sd
 
 def gemma3_norm_corrections(sd):
+    # Reverse change from Gemma3Model modify_tensors in llama.cpp convert script
     norm_patterns = [
         "input_layernorm.weight",
         "post_attention_layernorm.weight",
@@ -254,59 +259,6 @@ def gemma3_norm_corrections(sd):
                 sd[key] = sd[key].float() - 1.0
             corrected += 1
     #logging.info(f"Gemma3: Applied -1 norm correction to {corrected} tensors")
-    return sd
-
-def gguf_gemma3_tokenizer_loader(path):
-    logging.info("Attempting to recreate sentencepiece tokenizer from GGUF file metadata...")
-    try:
-        from sentencepiece import sentencepiece_model_pb2 as model
-    except ImportError:
-        raise ImportError("Please install sentencepiece and protobuf.\npip install sentencepiece protobuf")
-    spm = model.ModelProto()
-    reader = gguf.GGUFReader(path)
-
-    spm.normalizer_spec.name = "identity"
-    spm.normalizer_spec.add_dummy_prefix = False
-    spm.trainer_spec.model_type = 2
-    spm.trainer_spec.input_format = "tsv"
-    spm.trainer_spec.byte_fallback = True
-    spm.trainer_spec.max_sentence_length = 4192
-    spm.trainer_spec.bos_piece = "<bos>"
-
-    tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
-    scores = get_list_field(reader, "tokenizer.ggml.scores", float)
-    toktype = get_list_field(reader, "tokenizer.ggml.token_type", int)
-    
-    if not tokens or not scores or not toktype:
-        raise ValueError("Missing tokenizer metadata")
-    
-    for idx in range(len(tokens)):
-        piece = spm.SentencePiece()
-        piece.piece = tokens[idx]
-        if idx == 3:  # UNK position
-            piece.type = 2  # UNK Token
-            piece.score = 0.0 # UNK Score
-        else:
-            piece.type = toktype[idx]
-            piece.score = scores[idx]
-        spm.pieces.append(piece)
-    
-    spm.trainer_spec.vocab_size = len(spm.pieces)
-    logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
-    
-    del reader
-    return torch.ByteTensor(list(spm.SerializeToString()))
-
-def llama_permute(raw_sd, n_head, n_head_kv):
-    # Reverse version of LlamaModel.permute in llama.cpp convert script
-    sd = {}
-    permute = lambda x,h: x.reshape(h, x.shape[0] // h // 2, 2, *x.shape[1:]).swapaxes(1, 2).reshape(x.shape)
-    for k,v in raw_sd.items():
-        if k.endswith(("q_proj.weight", "q_proj.bias")):
-            v.data = permute(v.data, n_head)
-        if k.endswith(("k_proj.weight", "k_proj.bias")):
-            v.data = permute(v.data, n_head_kv)
-        sd[k] = v
     return sd
 
 def strip_quant_suffix(name):
@@ -473,6 +425,48 @@ def gguf_tekken_tokenizer_loader(path, temb_shape):
     del reader
     return torch.ByteTensor(list(json.dumps(data).encode('utf-8')))
 
+def gguf_gemma3_tokenizer_loader(path):
+    #TODO: merge into gguf_tokenizer_loader
+    logging.info("Attempting to recreate sentencepiece tokenizer from GGUF file metadata...")
+    try:
+        from sentencepiece import sentencepiece_model_pb2 as model
+    except ImportError:
+        raise ImportError("Please install sentencepiece and protobuf.\npip install sentencepiece protobuf")
+    spm = model.ModelProto()
+    reader = gguf.GGUFReader(path)
+
+    spm.normalizer_spec.name = "identity"
+    spm.normalizer_spec.add_dummy_prefix = False
+    spm.trainer_spec.model_type = 2
+    spm.trainer_spec.input_format = "tsv"
+    spm.trainer_spec.byte_fallback = True
+    spm.trainer_spec.max_sentence_length = 4192
+    spm.trainer_spec.bos_piece = "<bos>"
+
+    tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
+    scores = get_list_field(reader, "tokenizer.ggml.scores", float)
+    toktype = get_list_field(reader, "tokenizer.ggml.token_type", int)
+    
+    if not tokens or not scores or not toktype:
+        raise ValueError("Missing tokenizer metadata")
+    
+    for idx in range(len(tokens)):
+        piece = spm.SentencePiece()
+        piece.piece = tokens[idx]
+        if idx == 3:  # UNK position
+            piece.type = 2  # UNK Token
+            piece.score = 0.0 # UNK Score
+        else:
+            piece.type = toktype[idx]
+            piece.score = scores[idx]
+        spm.pieces.append(piece)
+    
+    spm.trainer_spec.vocab_size = len(spm.pieces)
+    logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
+    
+    del reader
+    return torch.ByteTensor(list(spm.SerializeToString()))
+
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
@@ -498,7 +492,6 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         if arch == "gemma3":
-            sd = fix_gemma3_llama_cpp_keys(sd)
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
         else:
